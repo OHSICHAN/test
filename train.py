@@ -1,208 +1,103 @@
-# %%
-"""
-USAGE
-nohup python train.py | tee train.log & disown
-"""
-import torch
+# %% nohup python -u train.py > logs/train_$(date +"%Y%m%d_%H%M%S").log 2>&1 & echo $! > train_pid.log
+import argparse
+from data.pdb.pdb import PDBBindDataset
+from src.layers import MoireLayer, get_moire_focus, LigandProjection
+from utils.exp import Aliquot, set_device, set_verbose
+from torch.optim.lr_scheduler import LambdaLR
+from torch import optim
 import torch.nn as nn
+import torch
 import torch.nn.functional as F
-import torch.optim as optim
-from utils import (
-    GraphDataset,
-    evaluate_model,
-)
-from model import DeepInteract
-import wandb
-import random
-from settings import PROJECT_NAME, WANDB, BATCH_SIZE, EVALUATION_SIZE, LEARNING_RATE, NUM_EPOCHS, CUTOFF, PATIENCE, LOAD_MODEL, get_device
 
-# SETTINGS
-device = get_device(verbose=True)
+# %%
+CONFIG = {
+    "MODEL": "Moire",
+    "DATASET": "PDBBind",
+    "DEPTH": 1,  # args.depth,  # [3 5 8 13 21]
+    "MLP_DIM": 384,  # args.dim,
+    "HEADS": 16,  # args.heads,
+    "FOCUS": "gaussian",
+    "DROPOUT": 0.2,
+    "BATCH_SIZE": 4,
+    "LEARNING_RATE": 5e-4,  # [5e-4, 5e-5] 범위
+    "WEIGHT_DECAY": 5e-4,  # lr 줄어드는 속도. 1e-2가 기본
+    "T_MAX": 400,  # wandb에서 보고 1 epoch에 들어 있는 step size의 2~3배를 해주세요
+    "ETA_MIN": 1e-7,  # lr 최솟값. 보통 조정할 필요 없음.
+    "DEVICE": "cuda",
+    "SCALE_MIN": 1.0,  # shift 최솟값.
+    "SCALE_MAX": 3.5,  # shift 최댓값.
+    "WIDTH_BASE": 1.3,  # 보통 조정할 필요 없음.
+    "VERBOSE": True,
+}
 
-def save_best_model(model, eval_loss, best_eval_loss):
-    if eval_loss < best_eval_loss:
-        # Save the model with the wandb name
-        torch.save(model.state_dict(), wandb.run.name + ".pth")
-        return eval_loss
-    return best_eval_loss
+set_verbose(CONFIG["VERBOSE"])
+set_device(CONFIG["DEVICE"])
+dataset = None
+match CONFIG["DATASET"]:
+    case "PDBBind":
+        dataset = PDBBindDataset()
+        criterion = nn.CrossEntropyLoss()
+dataset.float()
+dataset.batch_size = CONFIG["BATCH_SIZE"]
 
 
-# Training Loop
-def train_model(
-    model,
-    train_dataloader,
-    eval_dataloader,
-    criterion,
-    optimizer,
-    num_epochs=100,
-    patience=PATIENCE,
-):
-    model.train()
-    best_eval_loss = float("inf")
-    epochs_without_improvement = 0
-
-    for epoch in range(num_epochs):
-        total_loss = 0
-        for batch_idx, (node_features, adj_matrix, ligand, targets) in enumerate(
-            train_dataloader
-        ):
-            optimizer.zero_grad()
-            node_features = node_features.to(device)
-            adj_matrix = adj_matrix.to(device)
-            ligand = ligand.to(device)
-            targets = targets.to(device)
-            outputs = model(node_features, adj_matrix, ligand)
-            # output dtype to torch.float32
-            outputs = outputs.to(torch.float32)
-            targets = targets.to(torch.float32)
-            loss = criterion(outputs, targets)
-            loss.backward()
-            # NOTE: Gradient clipping
-            max_norm = 1.0  # Define the maximum norm
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-            optimizer.step()
-            total_loss += loss.item()
-
-            # Log the loss to WandB
-            if WANDB:
-                wandb.log({"Loss/train": loss.item()})
-
-        eval_loss = evaluate_model(model, eval_dataloader, criterion, device)
-
-        if eval_loss > 1:
-            continue
-
-        # Check for improvement
-        if eval_loss < best_eval_loss:
-            save_best_model(
-                model, eval_loss, best_eval_loss
-            )  # Update the best model if needed
-            best_eval_loss = eval_loss
-            epochs_without_improvement = 0  # Reset the counter
-        else:
-            epochs_without_improvement += 1
-
-        # Log evaluation loss
-        if WANDB:
-            wandb.log({"Loss/eval": eval_loss, "Best Loss/eval": best_eval_loss})
-
-        print(
-            f"Epoch {epoch+1:04}/{num_epochs:04} - Loss: {total_loss/len(train_dataloader):.4f} - Eval Loss: {eval_loss:.4f}"
+# %%
+class MyModel(nn.Module):
+    def __init__(self, config):
+        super(MyModel, self).__init__()
+        dims = config["MLP_DIM"]
+        self.ligand_projection = LigandProjection()
+        self.input = nn.Sequential(
+            nn.Linear(dataset.node_feat_size, dims),
+            nn.Linear(dims, dims),
+        )
+        self.layers = nn.ModuleList(
+            [
+                MoireLayer(
+                    input_dim=dims,
+                    output_dim=dims,
+                    num_heads=config["HEADS"],
+                    shift_min=config["SCALE_MIN"],
+                    shift_max=config["SCALE_MAX"],
+                    dropout=config["DROPOUT"],
+                    focus=get_moire_focus(config["FOCUS"]),
+                )
+                for _ in range(config["DEPTH"])
+            ]
+        )
+        self.output = nn.Sequential(
+            nn.Linear(dims, 192),
+            nn.Linear(192, 48),
         )
 
-        # Early stopping condition
-        if epochs_without_improvement >= patience:
-            print(f"Early stopping at epoch {epoch+1}")
-            break
+    def forward(self, x, adj, mask, ligand):
+        x = self.input(x)
+        for layer in self.layers:
+            x = layer(x, adj, mask)
+        batch_size, num_nodes, node_feature_size = x.shape
+        x = x.view(batch_size * num_nodes, node_feature_size)
+        x = self.output(x)
+        x = x.view(batch_size, num_nodes, -1)
+        ligand_p = self.ligand_projection(ligand)
+        ligand_p = ligand_p.unsqueeze(1).repeat(1, x.shape[1], 1)
+        interaction = (x * ligand_p).sum(dim=-1)
+        interaction = F.relu(interaction)
+        return interaction
 
-    # Finish the WandB run
-    if WANDB:
-        wandb.finish()
 
-
-DIR = "/Users/saankim/Documents/dev/DeepInteract/dataset/{}"
-DIR = "/home/bioscience/dev/DeepInteract/features/all/{}"
-
-node_features = torch.load(
-    DIR.format("node.pth"),
-    map_location=torch.device(device="cpu"),
-    # weights_only=True,
-)[:CUTOFF]
-node_features = [n.squeeze(0) for n in node_features]
-adjacency_matrices = torch.load(
-    DIR.format("adj.pth"),
-    map_location=torch.device(device="cpu"),
-    # weights_only=True,
-)[:CUTOFF]
-# move to device
-ligands = torch.load(
-    DIR.format("mol.pth"),
-    map_location=torch.device(device="cpu"),
-    # weights_only=True,
-)[:CUTOFF]
-targets = torch.load(
-    DIR.format("regr.pth"),
-    map_location=torch.device(device="cpu"),
-    # weights_only=True,
-)[:CUTOFF]
-# remove datapoints with len(node_features) > 600 or len(node_features) < 100
-indices = [i for i, nf in enumerate(node_features) if 100 <= len(nf) <= 600]
-node_features = [node_features[i] for i in indices]
-adjacency_matrices = [adjacency_matrices[i] for i in indices]
-ligands = [ligands[i] for i in indices]
-targets = [targets[i] for i in indices]
-targets = [t - 1 for t in targets]  # 1 옹스트롬 이내는 강한 interaction
-targets = [t / 30 for t in targets]
-targets = [torch.log(t) for t in targets]
-targets = [t * -t.abs() for t in targets]
-targets = [F.elu(t) for t in targets]
-targets = [torch.clamp(t, -2, 2) for t in targets]
-
-# display histogram of a target
-# import matplotlib.pyplot as plt
-
-# Iterate over targets to create cumulative histogram over all targets
-# for target in targets[:100]:
-#     plt.hist(target.to("cpu").numpy(), alpha=0.3, bins=20)
-#     plt.xlabel("Distance Value")
-#     plt.ylabel("Count")
-
-# plt.show()
-
-# Sample number of random datapoints for training and evaluation
-indices = list(range(len(node_features)))
-random.shuffle(indices)
-eval_indices = indices[:EVALUATION_SIZE]
-train_indices = indices[EVALUATION_SIZE:]
-
-# Sanity check
-print(f"Number of datapoints: {len(node_features)}")
-assert (
-    len(node_features) == len(adjacency_matrices) == len(ligands) == len(targets)
-), "The number of datapoints are not equal"
-assert (
-    len(train_indices) + len(eval_indices) == len(node_features)
-), "The split is not correct"
-assert (
-    len(train_indices) % BATCH_SIZE == 0
-), "The batch size is not a factor of the training set"
-
-# %% Train Run
-# Create dataloaders
-train_dataloader = GraphDataset(
-    [node_features[i] for i in train_indices],
-    [adjacency_matrices[i] for i in train_indices],
-    [ligands[i] for i in train_indices],
-    [targets[i] for i in train_indices],
-).DataLoader(batch_size=BATCH_SIZE)
-eval_dataloader = GraphDataset(
-    [node_features[i] for i in eval_indices],
-    [adjacency_matrices[i] for i in eval_indices],
-    [ligands[i] for i in eval_indices],
-    [targets[i] for i in eval_indices],
-).DataLoader(batch_size=BATCH_SIZE)
-
-# Initialize model, loss function, and optimizer
-model = DeepInteract()
-if LOAD_MODEL:
-    model.load_state_dict(torch.load(LOAD_MODEL))
-    print(f"Model loaded from {LOAD_MODEL}")
-model.to(device)
-
-# Initialize loss function and optimizer
-criterion = nn.MSELoss()
-optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-
-# Initialize WandB run
-if WANDB:
-    wandb.init(project=PROJECT_NAME)
-
-# Train the model
-train_model(
-    model,
-    train_dataloader=train_dataloader,
-    eval_dataloader=eval_dataloader,
-    criterion=criterion,
-    optimizer=optimizer,
-    num_epochs=NUM_EPOCHS,
+model = MyModel(CONFIG)
+if CONFIG["DEVICE"] == "cuda":
+    model = nn.DataParallel(model)
+optimizer = optim.AdamW(
+    model.parameters(), lr=CONFIG["LEARNING_RATE"], weight_decay=CONFIG["WEIGHT_DECAY"]
 )
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    optimizer, T_max=CONFIG["T_MAX"], eta_min=CONFIG["ETA_MIN"]
+)
+Aliquot(
+    model=model,
+    dataset=dataset,
+    optimizer=optimizer,
+    criterion=criterion,
+    scheduler=scheduler,
+)(wandb_project="deepInteract", wandb_config=CONFIG, num_epochs=1000, patience=20)
